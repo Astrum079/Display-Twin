@@ -6,6 +6,7 @@
 #include "encoder/NvencEncoder.h"
 #include "encoder/VideoEncoder.h"
 #include "hid/VirtualPen.h"
+#include "network/NetworkInfo.h"
 #include "network/UdpTransport.h"
 #include "protocol/Control.h"
 #include "protocol/Packets.h"
@@ -394,6 +395,21 @@ void HostController::Run(HostSettings settings, LogCallback rawLog) {
     // tip that was mid-drag when the link died, and clears sequence
     // tracking (so the next session's numbering, which may restart from 0
     // if the Android app itself relaunched, isn't rejected as "stale").
+    // FEC costs ~12.5% extra datagrams and only pays off on a lossy link.
+    // Over USB tethering (the tablet is that adapter's gateway) loss is
+    // essentially nil, so skip it there and save the airtime/latency.
+    std::atomic<bool> useFec{settings.enableFec};
+    auto updateFec = [&](const std::string& tabletIp) {
+        bool usb = false;
+        for (const AdapterInfo& adapter : EnumerateIPv4Adapters()) {
+            if (adapter.likelyTethering && adapter.gateway == tabletIp) { usb = true; break; }
+        }
+        useFec.store(settings.enableFec && !usb);
+        Log(log, std::string("[Net] FEC ") + (useFec.load() ? "on" : "off") +
+                     (usb ? " (USB tethering link)" : ""));
+    };
+    updateFec(settings.tabletIp);
+
     constexpr DWORD kPenSilenceTimeoutMs = 3000;
     auto resetPenSession = [&](const char* reason) {
         inputReceiver.ResetSourceLock();
@@ -442,6 +458,7 @@ void HostController::Run(HostSettings settings, LogCallback rawLog) {
             if (videoSender.SetDestination(ip)) {
                 Log(log, "[Session] WELCOME id=" + std::to_string(assigned) + " -> " + ip +
                              "; video destination updated");
+                updateFec(ip);
             }
             resetPenSession("new session");
             encoder.RequestKeyframe();
@@ -545,7 +562,7 @@ void HostController::Run(HostSettings settings, LogCallback rawLog) {
     std::ostringstream ready;
     ready << "[PC] Streaming to " << settings.tabletIp << ":" << settings.videoPort
           << " (control " << settings.controlPort << ", FEC "
-          << (settings.enableFec ? "on" : "off") << ", QoS "
+          << (useFec.load() ? "on" : "off") << ", QoS "
           << (settings.enableQos ? "on" : "off") << ")";
     Log(log, ready.str());
 
@@ -590,7 +607,7 @@ void HostController::Run(HostSettings settings, LogCallback rawLog) {
         for (const auto& packet : packets) {
             if (!videoSender.Send(packet)) { sent = false; break; }
         }
-        if (sent && settings.enableFec) {
+        if (sent && useFec.load()) {
             for (const auto& parity : BuildFecPackets(activeSession, frameId, timestamp, encoded)) {
                 if (!videoSender.Send(parity)) break;  // Parity is best-effort.
             }
@@ -642,6 +659,7 @@ void HostController::Run(HostSettings settings, LogCallback rawLog) {
             if (hasIp) {
                 if (videoSender.SetDestination(newIp)) {
                     Log(log, "[PC] Video destination updated to " + newIp + ":" + std::to_string(settings.videoPort));
+                    updateFec(newIp);
                 } else {
                     Log(log, "[ERROR] Failed to update video destination to " + newIp);
                 }

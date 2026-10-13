@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : AppCompatActivity() {
     private var decoder: H264Decoder? = null
     private var decoderPipeline: DecoderPipeline? = null
+    private var upscaler: UpscaleRenderer? = null
     private var udpReceiver: UdpReceiver? = null
     private var videoReassembler: VideoReassembler? = null
     private var penSender: PenInputSender? = null
@@ -44,6 +45,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var changeIpButton: Button
     private lateinit var openTetheringButton: Button
     private var localIp = "Unavailable"
+    private var peakRefreshRate = 0f
     private var detailExpanded = false
     private var lastCompletedFrames = 0L
 
@@ -75,6 +77,23 @@ class MainActivity : AppCompatActivity() {
                         View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
                         View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 )
+
+        // Ask for a ~120Hz mode at the current resolution: on a variable-refresh
+        // panel the system may sit at 60Hz, and every frame then waits up to
+        // 16.7ms for the next scanout instead of 8.3. 120 is an exact multiple
+        // of the 60fps stream (144 would beat unevenly and the link can't
+        // use the extra rate anyway).
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.let { display ->
+            val current = display.mode
+            display.supportedModes
+                .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+                .minByOrNull { Math.abs(it.refreshRate - TARGET_REFRESH_HZ) }
+                ?.let { best ->
+                    window.attributes = window.attributes.apply { preferredDisplayModeId = best.modeId }
+                    peakRefreshRate = best.refreshRate
+                }
+        }
 
         penSurfaceView = findViewById(R.id.penSurfaceView)
         inkOverlayView = findViewById(R.id.inkOverlayView)
@@ -122,6 +141,9 @@ class MainActivity : AppCompatActivity() {
         penSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 Log.d(TAG, "Surface created")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && peakRefreshRate > 0f) {
+                    holder.surface.setFrameRate(peakRefreshRate, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+                }
                 initialize()
             }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -413,7 +435,11 @@ class MainActivity : AppCompatActivity() {
         // 2. Decoder - once the real stream size is known, resize the surface
         //    so the picture keeps the PC's aspect ratio and touch mapping
         //    lines up with what's displayed.
-        decoder = H264Decoder(penSurfaceView.holder.surface) { width, height ->
+        // Bicubic upscale on the tablet instead of the compositor's bilinear
+        // stretch; falls back to the plain surface if GL setup fails.
+        upscaler = UpscaleRenderer(penSurfaceView.holder.surface).takeIf { it.start() }
+        decoder = H264Decoder(upscaler?.inputSurface ?: penSurfaceView.holder.surface) { width, height ->
+            upscaler?.setVideoSize(width, height)
             runOnUiThread {
                 penSurfaceView.setVideoSize(width, height)
                 inkOverlayView.setVideoSize(width, height)
@@ -498,6 +524,8 @@ class MainActivity : AppCompatActivity() {
         decoderPipeline = null
         decoder?.release()
         decoder = null
+        upscaler?.release()
+        upscaler = null
         penSender?.close()
         penSender = null
         lastCompletedFrames = 0L
@@ -520,6 +548,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val TARGET_REFRESH_HZ = 120f
         private const val PREFS_NAME = "display_twin_prefs"
         private const val KEY_PC_IP = "pc_ip"
         // A drawing session is long, but an unbounded PARTIAL_WAKE_LOCK is a
