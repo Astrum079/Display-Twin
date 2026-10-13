@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : AppCompatActivity() {
     private var decoder: H264Decoder? = null
     private var decoderPipeline: DecoderPipeline? = null
+    private var upscaler: UpscaleRenderer? = null
     private var udpReceiver: UdpReceiver? = null
     private var videoReassembler: VideoReassembler? = null
     private var penSender: PenInputSender? = null
@@ -413,7 +414,11 @@ class MainActivity : AppCompatActivity() {
         // 2. Decoder - once the real stream size is known, resize the surface
         //    so the picture keeps the PC's aspect ratio and touch mapping
         //    lines up with what's displayed.
-        decoder = H264Decoder(penSurfaceView.holder.surface) { width, height ->
+        // Bicubic upscale on the tablet instead of the compositor's bilinear
+        // stretch; falls back to the plain surface if GL setup fails.
+        upscaler = UpscaleRenderer(penSurfaceView.holder.surface).takeIf { it.start() }
+        decoder = H264Decoder(upscaler?.inputSurface ?: penSurfaceView.holder.surface) { width, height ->
+            upscaler?.setVideoSize(width, height)
             runOnUiThread {
                 penSurfaceView.setVideoSize(width, height)
                 inkOverlayView.setVideoSize(width, height)
@@ -498,6 +503,8 @@ class MainActivity : AppCompatActivity() {
         decoderPipeline = null
         decoder?.release()
         decoder = null
+        upscaler?.release()
+        upscaler = null
         penSender?.close()
         penSender = null
         lastCompletedFrames = 0L
